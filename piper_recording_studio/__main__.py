@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 from uuid import uuid4
-
+import os
+import subprocess
+import boto3
 import hypercorn
 from quart import (
     Quart,
@@ -21,6 +23,12 @@ from quart import (
 _LOGGER = logging.getLogger(__name__)
 _DIR = Path(__file__).parent
 
+session = boto3.session.Session()
+client = session.client('s3',
+                        region_name='fra1',
+                        endpoint_url='https://olimi.fra1.digitaloceanspaces.com',
+                        aws_access_key_id='DO00EDBQGNPHFBGT3REA',
+                        aws_secret_access_key='kM9zeI+/EB41qUgMvOmQHIhAB7Q7rRYedd9XM1ndLFQ')
 
 @dataclass
 class Prompt:
@@ -220,22 +228,96 @@ def main() -> None:
         if args.multi_user:
             user_id = form.get("userId")
             audio_dir = output_dir / f"user_{user_id}"
-            user_dir = audio_dir / language
-            if not user_dir.is_dir():
-                _LOGGER.warning("No user/language directory: %s", user_dir)
-                raise RuntimeError("Invalid login code")
         else:
             user_id = None
             audio_dir = output_dir
 
+        user_dir = audio_dir / language
+        if not user_dir.is_dir():
+            _LOGGER.warning("No user/language directory: %s", user_dir)
+            raise RuntimeError("Invalid login code")
+
         files = await request.files
         dataset_file = files["dataset"]
-        upload_path = user_dir / "_uploads" / Path(dataset_file.filename).name
+        upload_path = '/home/incode/piper-recording-studio/prompts/Arabic (Egypt)_ar-EG' / Path(dataset_file.filename).name
         upload_path.parent.mkdir(parents=True, exist_ok=True)
         await dataset_file.save(upload_path)
         _LOGGER.debug("Saved dataset to %s", upload_path)
 
         return await render_template("done.html")
+
+    @app.route("/convert")
+    async def api_convert() -> str:
+        "Convert all webm files to wav"
+        language = request.args.get("language", 'ar-EG')
+        file = request.args.get("file", 'metadata')
+
+        # Directory containing the .webm files
+        directory = f'/home/incode/piper-recording-studio/output/{language}/{file}'
+
+        return await convert_files(directory)
+
+    async def convert_files(directory):
+        async def generate():
+            for filename in os.listdir(directory):
+                if filename.endswith('.webm'):
+                    webm_file = os.path.join(directory, filename)
+                    wav_file = os.path.join(directory, f"{os.path.splitext(filename)[0]}.wav")
+                    
+                    command = ['ffmpeg', '-y', '-i', webm_file, '-ac', '1', '-ar', '22050', wav_file]
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    
+                    while True:
+                        output = process.stderr.readline()
+                        if output == '' and process.poll() is not None:
+                            break
+                        if output:
+                            print(f"data:{output}\n\n")
+                            yield f"data:{output}\n\n"
+                    process.wait()
+
+            yield "data:Conversion complete.\n\n"
+
+        return Response(generate(), mimetype='text/event-stream')
+
+    @app.route("/upload-to-digitalocean")
+    async def api_upload_to_digitalocean() -> str:
+        "Upload all wav files to digitalocean"
+        language = request.args.get("language", 'ar-EG')
+        file = request.args.get("file", 'metadata')
+
+        # Directory containing the .webm files
+        directory = f'{os.getcwd()}/output/{language}/{file}'
+
+        return await upload_to_digitalocean(directory)
+
+    def upload_file_to_digital_ocean(file_path, object_key):
+        with open(file_path, 'rb') as file:
+            content = file.read()
+            response = client.put_object(Bucket='incodehub-bucket', # The path to the directory you want to upload the object to, starting with your Space name.
+                                Key=object_key, # Object key, referenced whenever you want to access this file later.
+                                Body=content, # The object's contents.
+                                ACL='public-read', # Defines Access-control List (ACL) permissions, such as private or public.
+                            )
+
+
+    async def upload_to_digitalocean(directory, upload_to_dir='Rana'):
+        async def generate():
+            counter = 0
+            for labels_file_path in os.listdir(directory):
+                counter += 1
+                if not labels_file_path.endswith('wav'): continue
+                print(f"{counter}/{len(os.listdir(directory))} - working on {labels_file_path}")
+                yield f"{counter}/{len(os.listdir(directory))} - working on {labels_file_path}"
+
+                file_path = os.path.join(directory, labels_file_path)
+                file_name = os.path.basename(file_path)
+
+                upload_file_to_digital_ocean(file_path, f'{upload_to_dir}/{file_name}')
+
+            yield "data:Conversion complete.\n\n"
+
+        return Response(generate(), mimetype='text/event-stream')
 
     @app.errorhandler(Exception)
     async def handle_error(err) -> Tuple[str, int]:
